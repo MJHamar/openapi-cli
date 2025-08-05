@@ -6,13 +6,14 @@ from typing import Dict, List, Any, Optional, Union
 import re
 import requests
 import json
+from .parameter_parser import ParameterParser, ParsedParameter, ParameterCollector
 
 
 class APIEndpoint:
     """Represents a single API endpoint from an OpenAPI specification"""
     
     def __init__(self, base_url: str, path: str, method: str, operation: Dict[str, Any], 
-                 openapi_version: str = "3.0.0"):
+                 openapi_version: str = "3.0.0", spec: Optional[Dict[str, Any]] = None):
         """
         Initialize an API endpoint.
         
@@ -22,6 +23,7 @@ class APIEndpoint:
             method: HTTP method (GET, POST, etc.)
             operation: OpenAPI operation object
             openapi_version: OpenAPI specification version
+            spec: Full OpenAPI specification for resolving references
         """
         self.base_url = base_url.rstrip('/')
         self.path = path
@@ -32,13 +34,18 @@ class APIEndpoint:
         # Generate command name
         self.command_name = self._generate_command_name()
         
-        # Parse parameters
+        # Initialize parameter parser
+        self.parameter_parser = ParameterParser(openapi_version, spec)
+        
+        # Parse parameters using the new parser
         self.parameters = self._parse_parameters()
-        self.required_params = self._get_required_parameters()
-        self.optional_params = self._get_optional_parameters()
+        self.parsed_parameters = self._parse_all_parameters()
+        self.required_params = [p for p in self.parsed_parameters if p.required]
+        self.optional_params = [p for p in self.parsed_parameters if not p.required]
         
         # Store user-provided parameter values
         self.param_values: Dict[str, Any] = {}
+        self.parameter_collector = ParameterCollector()
     
     def _generate_command_name(self) -> str:
         """Generate command name using operationId or method_path fallback"""
@@ -76,6 +83,15 @@ class APIEndpoint:
         
         return params
     
+    def _parse_all_parameters(self) -> List[ParsedParameter]:
+        """Parse all parameters using the new parameter parser"""
+        parsed_params = []
+        
+        for param in self.parameters:
+            parsed_params.extend(self.parameter_parser.parse_parameter(param))
+        
+        return parsed_params
+    
     def _get_required_parameters(self) -> List[Dict[str, Any]]:
         """Get list of required parameters"""
         return [p for p in self.parameters if p.get('required', False)]
@@ -84,26 +100,24 @@ class APIEndpoint:
         """Get list of optional parameters"""
         return [p for p in self.parameters if not p.get('required', False)]
     
-    def _get_parameter_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+    def _get_parameter_by_name(self, name: str) -> Optional[ParsedParameter]:
         """Get parameter definition by name"""
-        for param in self.parameters:
-            if param.get('name') == name:
+        for param in self.parsed_parameters:
+            if param.name == name:
                 return param
         return None
     
     def _are_all_required_params_supplied(self) -> bool:
         """Check if all required parameters have been supplied"""
         for param in self.required_params:
-            param_name = param.get('name')
-            if param_name not in self.param_values:
+            if param.name not in self.param_values:
                 return False
         return True
     
     def _are_all_optional_params_supplied(self) -> bool:
         """Check if all optional parameters have been supplied"""
         for param in self.optional_params:
-            param_name = param.get('name')
-            if param_name not in self.param_values:
+            if param.name not in self.param_values:
                 return False
         return True
     
@@ -113,72 +127,37 @@ class APIEndpoint:
             return False
             
         missing_optional = [p for p in self.optional_params 
-                           if p.get('name') not in self.param_values]
+                           if p.name not in self.param_values]
         
         if not missing_optional:
             return False
         
-        print(f"Optional parameters available: {[p.get('name') for p in missing_optional]}")
+        print(f"Optional parameters available: {[p.name for p in missing_optional]}")
         response = input("Would you like to supply additional parameters? (Y/n): ").strip()
         
         # Default to Yes if empty or starts with Y/y
         return response == '' or response.lower().startswith('y')
     
-    def _build_request_url(self) -> str:
-        """Build the full request URL with path parameters substituted"""
+    def _build_request_components(self) -> tuple[str, Dict[str, Any], Dict[str, str], Any]:
+        """Build all request components using the parameter collector"""
+        path_params, query_params, headers, body = self.parameter_collector.build_request_data(self.parsed_parameters)
+        
+        # Build URL with path parameter substitution
         url = f"{self.base_url}{self.path}"
+        for param_name, param_value in path_params.items():
+            placeholder = f"{{{param_name}}}"
+            url = url.replace(placeholder, str(param_value))
         
-        # Substitute path parameters
-        for param in self.parameters:
-            if param.get('in') == 'path':
-                param_name = param.get('name')
-                if param_name in self.param_values:
-                    placeholder = f"{{{param_name}}}"
-                    url = url.replace(placeholder, str(self.param_values[param_name]))
-        
-        return url
-    
-    def _build_request_params(self) -> Dict[str, Any]:
-        """Build query parameters for the request"""
-        query_params = {}
-        
-        for param in self.parameters:
-            if param.get('in') == 'query':
-                param_name = param.get('name')
-                if param_name in self.param_values:
-                    query_params[param_name] = self.param_values[param_name]
-        
-        return query_params
-    
-    def _build_request_headers(self) -> Dict[str, str]:
-        """Build headers for the request"""
-        headers = {}
-        
-        for param in self.parameters:
-            if param.get('in') == 'header':
-                param_name = param.get('name')
-                if param_name in self.param_values:
-                    headers[param_name] = str(self.param_values[param_name])
-        
-        return headers
-    
-    def _build_request_body(self) -> Optional[Any]:
-        """Build request body"""
-        for param in self.parameters:
-            if param.get('in') == 'body':
-                param_name = param.get('name')
-                if param_name in self.param_values:
-                    return self.param_values[param_name]
-        
-        return None
+        return url, query_params, headers, body
     
     def _execute_request(self) -> None:
         """Execute the HTTP request and pretty-print the response"""
         try:
-            url = self._build_request_url()
-            params = self._build_request_params()
-            headers = self._build_request_headers()
-            body = self._build_request_body()
+            # Set parameter values in the collector
+            self.parameter_collector.values = self.param_values.copy()
+            
+            # Build request components
+            url, params, headers, body = self._build_request_components()
             
             # Set content-type for body requests
             if body is not None and 'content-type' not in [h.lower() for h in headers.keys()]:
@@ -239,8 +218,8 @@ class APIEndpoint:
         
         # Check if all required parameters are supplied
         if not self._are_all_required_params_supplied():
-            missing_required = [p.get('name') for p in self.required_params 
-                              if p.get('name') not in self.param_values]
+            missing_required = [p.name for p in self.required_params 
+                              if p.name not in self.param_values]
             print(f"Missing required parameters: {missing_required}")
             return self
         
@@ -248,6 +227,20 @@ class APIEndpoint:
         if not self._are_all_optional_params_supplied():
             print("Some optional parameters are not supplied.")
             if self._prompt_for_optional_params():
+                # Collect missing parameters interactively
+                missing_params = [p for p in self.parsed_parameters 
+                                if p.name not in self.param_values]
+                if missing_params:
+                    print("Please provide the missing parameters:")
+                    for param in missing_params:
+                        if param.required or input(f"Provide {param.name}? (y/N): ").strip().lower().startswith('y'):
+                            try:
+                                value = param.collect_input()
+                                if value is not None:
+                                    self.param_values[param.name] = value
+                            except (KeyboardInterrupt, EOFError):
+                                print(f"\nSkipping parameter {param.name}")
+                                continue
                 return self
         
         # All required parameters supplied, execute the request
@@ -276,20 +269,14 @@ class APIEndpoint:
         if self.required_params:
             print(f"\nRequired parameters:")
             for param in self.required_params:
-                param_name = param.get('name', 'unknown')
-                param_type = param.get('type', 'string')
-                param_desc = param.get('description', 'No description')
-                status = "✓" if param_name in self.param_values else "✗"
-                print(f"  {status} {param_name} ({param_type}): {param_desc}")
+                status = "✓" if param.name in self.param_values else "✗"
+                print(f"  {status} {param.name} -- {param.get_type_display()}: {param.description}")
         
         if self.optional_params:
             print(f"\nOptional parameters:")
             for param in self.optional_params:
-                param_name = param.get('name', 'unknown')
-                param_type = param.get('type', 'string')
-                param_desc = param.get('description', 'No description')
-                status = "✓" if param_name in self.param_values else "✗"
-                print(f"  {status} {param_name} ({param_type}): {param_desc}")
+                status = "✓" if param.name in self.param_values else "✗"
+                print(f"  {status} {param.name} -- {param.get_type_display()}: {param.description}")
     
     def complete_(self, text: str, line: str, begidx: int, endidx: int) -> List[str]:
         """

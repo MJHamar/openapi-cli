@@ -356,7 +356,8 @@ class OpenAPICLI(cmd.Cmd):
                     path=endpoint_def['path'],
                     method=endpoint_def['method'],
                     operation=operation,
-                    openapi_version=self.openapi_version
+                    openapi_version=self.openapi_version,
+                    spec=self.spec
                 )
                 endpoints.append(endpoint)
                 
